@@ -1,0 +1,68 @@
+app:
+  name: "Vendor Performance Analysis"
+  version: "1.0.0"
+  environment: "development"  # development, staging, production
+  log_level: "INFO"
+
+database:
+  # SQL Server connection settings
+  driver: "ODBC Driver 17 for SQL Server"
+  server: "localhost"
+  database: "vendor_analytics"
+  user: "sa"
+  password: "YourPassword123!"
+  timeout: 30
+
+pipeline:
+  # ETL Configuration
+  batch_size: 1000
+  lookback_days: 90  # How many days of historical data to process
+  incremental_mode: true  # Only process recent data
+  validation_enabled: true
+  anomaly_detection: true
+  
+data:
+  raw_data_path: "data/raw"
+  processed_data_path: "data/processed"
+  sample_data_enabled: true
+
+kpis:
+  # KPI Configuration
+  on_time_delivery:
+    enabled: true
+    window_days: 30
+  defect_rate:
+    enabled: true
+    threshold: 5  # Alert if above 5%
+  lead_time:
+    enabled: true
+    threshold_days: 3  # Alert if variance > 3 days
+  cost_variance:
+    enabled: true
+    threshold_percent: 10  # Alert if > 10%
+
+sources:
+  # Data source configurations
+  csv:
+    enabled: true
+    path: "data/raw/vendors.csv"
+  
+  api:
+    enabled: false
+    endpoint: "https://api.example.com/vendors"
+    timeout: 30
+    retry_count: 3
+
+reporting:
+  # Report generation settings
+  email_on_failure: false
+  email_recipients:
+    - "admin@example.com"
+  schedule: "0 6 * * *"  # 6 AM daily (cron format)
+
+powerbi:
+  # Power BI integration settings
+  workspace_id: "your-workspace-id"
+  dataset_id: "your-dataset-id"
+  refresh_enabled: true
+  refresh_schedule: "daily"
