@@ -6,6 +6,7 @@ import numpy as np
 import sys
 from pathlib import Path
 import plotly.express as px
+import plotly.graph_objects as go
 from io import BytesIO
 
 # Add src to path
@@ -336,6 +337,173 @@ def display_what_if_simulator(scorecard: pd.DataFrame) -> None:
 
     focus_cols = [col for col in ['vendor_name', 'breach_count', 'otd_rate', 'defect_rate', 'lead_time_variance_days', 'cost_variance_percent'] if col in sim_df.columns]
     st.dataframe(sim_df.sort_values('breach_count', ascending=False)[focus_cols].head(10), use_container_width=True)
+
+
+def display_executive_summary(scorecard: pd.DataFrame) -> None:
+    """Generate an executive-level narrative from current KPI outcomes."""
+    st.subheader("🧾 Executive Summary Generator")
+    if scorecard.empty:
+        st.info("Load data to generate an executive summary.")
+        return
+
+    total_vendors = int(scorecard['vendor_id'].nunique()) if 'vendor_id' in scorecard.columns else len(scorecard)
+    top_vendor = scorecard.iloc[0]
+    bottom_vendor = scorecard.sort_values('composite_score', ascending=True).iloc[0]
+    avg_composite = pd.to_numeric(scorecard['composite_score'], errors='coerce').mean()
+    avg_otd = pd.to_numeric(scorecard['otd_rate'], errors='coerce').mean()
+    avg_defect = pd.to_numeric(scorecard['defect_rate'], errors='coerce').mean()
+    avg_lead = pd.to_numeric(scorecard['lead_time_variance_days'], errors='coerce').mean()
+
+    otd_target = 95.0
+    defect_target = float(config.DEFECT_RATE_THRESHOLD)
+    lead_target = float(config.LEAD_TIME_THRESHOLD)
+    risk_vendors = int((scorecard['performance_tier'] == 'Recovery Zone').sum())
+    strategic_vendors = int((scorecard['performance_tier'] == 'Strategic Partner').sum())
+
+    summary_lines = [
+        f"Data Source: {st.session_state.data_source}",
+        f"Vendor Coverage: {total_vendors} vendors analyzed.",
+        (
+            f"Portfolio Health: Average composite score is {avg_composite:.1f}/100 with "
+            f"{strategic_vendors} strategic partner(s) and {risk_vendors} recovery-zone vendor(s)."
+        ),
+        (
+            f"Service Performance: On-time delivery averages {avg_otd:.1f}% "
+            f"({'on target' if avg_otd >= otd_target else 'below target'} vs {otd_target:.0f}%)."
+        ),
+        (
+            f"Quality Performance: Defect rate averages {avg_defect:.2f}% "
+            f"({'on target' if avg_defect <= defect_target else 'above threshold'} vs {defect_target:.2f}%)."
+        ),
+        (
+            f"Lead Time Performance: Average variance is {avg_lead:.2f} day(s) "
+            f"({'within range' if abs(avg_lead) <= lead_target else 'outside range'} vs {lead_target:.0f} days)."
+        ),
+        (
+            f"Top Performer: {top_vendor.get('vendor_name', 'N/A')} "
+            f"(score {top_vendor.get('composite_score', np.nan):.1f})."
+        ),
+        (
+            f"Priority Improvement Candidate: {bottom_vendor.get('vendor_name', 'N/A')} "
+            f"(score {bottom_vendor.get('composite_score', np.nan):.1f})."
+        ),
+    ]
+
+    st.markdown("\n".join([f"- {line}" for line in summary_lines]))
+
+    summary_text = "Executive Summary\n" + "\n".join(summary_lines)
+    st.download_button(
+        label="Download Executive Summary (.txt)",
+        data=summary_text.encode('utf-8'),
+        file_name='executive_summary.txt',
+        mime='text/plain',
+        use_container_width=True,
+        key='download_exec_summary'
+    )
+
+
+def display_vendor_comparison(scorecard: pd.DataFrame) -> None:
+    """Compare two selected vendors side-by-side across KPI and score dimensions."""
+    st.subheader("⚔️ Vendor Comparison Mode")
+    if scorecard.empty:
+        st.info("Load data to compare vendors.")
+        return
+
+    options_df = scorecard[['vendor_id', 'vendor_name']].drop_duplicates().copy()
+    if options_df.empty:
+        st.info("No vendor options available for comparison.")
+        return
+
+    options_df['label'] = options_df.apply(
+        lambda row: f"{row['vendor_name']} (ID {row['vendor_id']})",
+        axis=1
+    )
+    option_labels = options_df['label'].tolist()
+
+    default_b_index = 1 if len(option_labels) > 1 else 0
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        vendor_a_label = st.selectbox("Vendor A", option_labels, index=0, key='vendor_a_selector')
+    with col_b:
+        vendor_b_label = st.selectbox("Vendor B", option_labels, index=default_b_index, key='vendor_b_selector')
+
+    if vendor_a_label == vendor_b_label:
+        st.warning("Select two different vendors to run comparison mode.")
+        return
+
+    vendor_a_id = options_df.loc[options_df['label'] == vendor_a_label, 'vendor_id'].iloc[0]
+    vendor_b_id = options_df.loc[options_df['label'] == vendor_b_label, 'vendor_id'].iloc[0]
+
+    vendor_a = scorecard.loc[scorecard['vendor_id'] == vendor_a_id].iloc[0]
+    vendor_b = scorecard.loc[scorecard['vendor_id'] == vendor_b_id].iloc[0]
+
+    metric_config = [
+        ('Composite Score', 'composite_score'),
+        ('Reliability Index', 'reliability_index'),
+        ('Efficiency Index', 'efficiency_index'),
+        ('On-Time Delivery %', 'otd_rate'),
+        ('Defect Rate %', 'defect_rate'),
+        ('Lead Time Variance (days)', 'lead_time_variance_days'),
+        ('Cost Variance %', 'cost_variance_percent'),
+    ]
+
+    comparison_rows = []
+    for label, col in metric_config:
+        if col not in scorecard.columns:
+            continue
+        a_value = pd.to_numeric(pd.Series([vendor_a.get(col)]), errors='coerce').iloc[0]
+        b_value = pd.to_numeric(pd.Series([vendor_b.get(col)]), errors='coerce').iloc[0]
+        comparison_rows.append({
+            'Metric': label,
+            vendor_a.get('vendor_name', 'Vendor A'): round(float(a_value), 2) if pd.notna(a_value) else np.nan,
+            vendor_b.get('vendor_name', 'Vendor B'): round(float(b_value), 2) if pd.notna(b_value) else np.nan,
+            'Difference (A-B)': round(float(a_value - b_value), 2) if pd.notna(a_value) and pd.notna(b_value) else np.nan,
+        })
+
+    comparison_df = pd.DataFrame(comparison_rows)
+    st.dataframe(comparison_df, use_container_width=True)
+
+    radar_metrics = [
+        ('Composite', 'composite_score'),
+        ('Reliability', 'reliability_index'),
+        ('Efficiency', 'efficiency_index'),
+        ('OTD Score', 'otd_score'),
+        ('Defect Score', 'defect_score'),
+        ('Lead-Time Score', 'lead_time_score'),
+        ('Cost Score', 'cost_score'),
+    ]
+
+    theta = []
+    a_r = []
+    b_r = []
+    for axis_label, axis_col in radar_metrics:
+        if axis_col in scorecard.columns:
+            a_val = pd.to_numeric(pd.Series([vendor_a.get(axis_col)]), errors='coerce').iloc[0]
+            b_val = pd.to_numeric(pd.Series([vendor_b.get(axis_col)]), errors='coerce').iloc[0]
+            theta.append(axis_label)
+            a_r.append(float(a_val) if pd.notna(a_val) else 0.0)
+            b_r.append(float(b_val) if pd.notna(b_val) else 0.0)
+
+    if theta:
+        fig = go.Figure()
+        fig.add_trace(go.Scatterpolar(
+            r=a_r,
+            theta=theta,
+            fill='toself',
+            name=vendor_a.get('vendor_name', 'Vendor A')
+        ))
+        fig.add_trace(go.Scatterpolar(
+            r=b_r,
+            theta=theta,
+            fill='toself',
+            name=vendor_b.get('vendor_name', 'Vendor B')
+        ))
+        fig.update_layout(
+            title='Vendor Capability Radar',
+            polar=dict(radialaxis=dict(visible=True, range=[0, 100]))
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 
 def display_upload_templates() -> None:
@@ -766,6 +934,12 @@ def main():
         display_data_health()
 
         scorecard = _prepare_vendor_scorecard()
+
+        st.divider()
+        display_executive_summary(scorecard)
+
+        st.divider()
+        display_vendor_comparison(scorecard)
 
         st.divider()
         display_vendor_intelligence(scorecard)
