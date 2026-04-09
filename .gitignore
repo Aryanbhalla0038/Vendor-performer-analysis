@@ -38,11 +38,11 @@ env/
 .env.local
 config.local.yaml
 
-# Data files (large files)
-data/raw/*.csv
-data/raw/*.xlsx
+# Data files
+# Keep sample input data in git for demos and Streamlit Cloud.
 data/processed/*.csv
 data/processed/*.parquet
+data/processed/*.xlsx
 
 # Logs
 logs/
