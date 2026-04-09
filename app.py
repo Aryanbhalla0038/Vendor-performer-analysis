@@ -5,7 +5,6 @@ import pandas as pd
 import sys
 from pathlib import Path
 import plotly.express as px
-import plotly.graph_objects as go
 from io import BytesIO
 
 # Add src to path
@@ -34,25 +33,109 @@ if 'data_loaded' not in st.session_state:
     st.session_state.deliveries = None
     st.session_state.quality_data = None
     st.session_state.kpis = None
+    st.session_state.validation_results = None
+    st.session_state.data_source = "Sample data"
 
 
-def load_data():
-    """Load data from CSV files."""
+REQUIRED_UPLOAD_COLUMNS = {
+    'vendors': ['vendor_id', 'vendor_name', 'country', 'vendor_category'],
+    'purchase_orders': ['po_id', 'vendor_id', 'order_value', 'po_date'],
+    'deliveries': ['delivery_id', 'po_id', 'vendor_id', 'actual_delivery_date', 'scheduled_delivery_date'],
+    'quality_data': ['inspection_id', 'delivery_id', 'vendor_id', 'inspection_date', 'defect_count', 'total_items']
+}
+
+
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize input column names for consistent downstream processing."""
+    normalized = df.copy()
+    normalized.columns = normalized.columns.str.lower().str.strip()
+    return normalized
+
+
+def _get_metric_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Return the first metric column found from candidate list."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _assign_loaded_data(vendors, purchase_orders, deliveries, quality_data, source_label: str) -> None:
+    """Persist loaded datasets in Streamlit session."""
+    st.session_state.vendors = vendors
+    st.session_state.purchase_orders = purchase_orders
+    st.session_state.deliveries = deliveries
+    st.session_state.quality_data = quality_data
+    st.session_state.data_loaded = True
+    st.session_state.data_source = source_label
+
+
+def load_sample_data():
+    """Load sample data from repository CSV files."""
     try:
         with st.spinner("Loading data..."):
             data_loader = DataLoader(config)
-            
-            st.session_state.vendors = data_loader.load_vendors()
-            st.session_state.purchase_orders = data_loader.load_purchase_orders()
-            st.session_state.deliveries = data_loader.load_deliveries()
-            st.session_state.quality_data = data_loader.load_quality_data()
-            
-            st.session_state.data_loaded = True
+
+            vendors = data_loader.load_vendors()
+            purchase_orders = data_loader.load_purchase_orders()
+            deliveries = data_loader.load_deliveries()
+            quality_data = data_loader.load_quality_data()
+
+            _assign_loaded_data(vendors, purchase_orders, deliveries, quality_data, "Sample data")
             logger.info("Data loaded successfully")
             return True
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
         logger.error(f"Failed to load data: {str(e)}")
+        return False
+
+
+def load_custom_data(vendors_file, po_file, deliveries_file, quality_file):
+    """Load custom user-uploaded CSV files."""
+    uploads = {
+        'vendors': vendors_file,
+        'purchase_orders': po_file,
+        'deliveries': deliveries_file,
+        'quality_data': quality_file
+    }
+
+    missing_files = [name for name, file in uploads.items() if file is None]
+    if missing_files:
+        st.error(f"Please upload all required files before processing: {', '.join(missing_files)}")
+        return False
+
+    try:
+        with st.spinner("Loading uploaded files..."):
+            loaded = {}
+            for name, file in uploads.items():
+                df = pd.read_csv(file)
+                loaded[name] = _standardize_columns(df)
+
+            validation_messages = []
+            for name, required_cols in REQUIRED_UPLOAD_COLUMNS.items():
+                missing_cols = [col for col in required_cols if col not in loaded[name].columns]
+                if missing_cols:
+                    validation_messages.append(
+                        f"{name} is missing required columns: {missing_cols}"
+                    )
+
+            if validation_messages:
+                for msg in validation_messages:
+                    st.error(msg)
+                return False
+
+            _assign_loaded_data(
+                loaded['vendors'],
+                loaded['purchase_orders'],
+                loaded['deliveries'],
+                loaded['quality_data'],
+                "Custom upload"
+            )
+            logger.info("Custom uploaded data loaded successfully")
+            return True
+    except Exception as e:
+        st.error(f"Error loading uploaded files: {str(e)}")
+        logger.error(f"Failed to load uploaded files: {str(e)}")
         return False
 
 
@@ -124,27 +207,43 @@ def display_kpi_cards():
     
     # On-Time Delivery Rate
     if 'on_time_delivery' in kpis and not kpis['on_time_delivery'].empty:
-        otd_rate = kpis['on_time_delivery']['on_time_delivery_rate'].mean()
+        metric_col = _get_metric_column(kpis['on_time_delivery'], ['on_time_delivery_rate'])
+        otd_rate = pd.to_numeric(kpis['on_time_delivery'][metric_col], errors='coerce').mean() if metric_col else None
         with col1:
-            st.metric("On-Time Delivery Rate", f"{otd_rate:.1f}%", delta="Target: >95%")
+            st.metric("On-Time Delivery Rate", f"{otd_rate:.1f}%" if pd.notna(otd_rate) else "N/A", delta="Target: >95%")
+    else:
+        with col1:
+            st.metric("On-Time Delivery Rate", "N/A", delta="Target: >95%")
     
     # Defect Rate
     if 'defect_rate' in kpis and not kpis['defect_rate'].empty:
-        defect = kpis['defect_rate']['defect_rate'].mean()
+        metric_col = _get_metric_column(kpis['defect_rate'], ['defect_rate'])
+        defect = pd.to_numeric(kpis['defect_rate'][metric_col], errors='coerce').mean() if metric_col else None
         with col2:
-            st.metric("Defect Rate", f"{defect:.1f}%", delta="Target: <5%")
+            st.metric("Defect Rate", f"{defect:.1f}%" if pd.notna(defect) else "N/A", delta="Target: <5%")
+    else:
+        with col2:
+            st.metric("Defect Rate", "N/A", delta="Target: <5%")
     
     # Lead Time Variance
     if 'lead_time_variance' in kpis and not kpis['lead_time_variance'].empty:
-        lead_time = kpis['lead_time_variance']['lead_time_variance_days'].mean()
+        metric_col = _get_metric_column(kpis['lead_time_variance'], ['avg_variance', 'lead_time_variance_days'])
+        lead_time = pd.to_numeric(kpis['lead_time_variance'][metric_col], errors='coerce').mean() if metric_col else None
         with col3:
-            st.metric("Lead Time Variance", f"{lead_time:.1f} days", delta="Target: ≤3 days")
+            st.metric("Lead Time Variance", f"{lead_time:.1f} days" if pd.notna(lead_time) else "N/A", delta="Target: ≤3 days")
+    else:
+        with col3:
+            st.metric("Lead Time Variance", "N/A", delta="Target: ≤3 days")
     
     # Cost Variance
     if 'cost_variance' in kpis and not kpis['cost_variance'].empty:
-        cost_var = kpis['cost_variance']['cost_variance_percent'].mean()
+        metric_col = _get_metric_column(kpis['cost_variance'], ['cost_variance_percent'])
+        cost_var = pd.to_numeric(kpis['cost_variance'][metric_col], errors='coerce').mean() if metric_col else None
         with col4:
-            st.metric("Cost Variance", f"{cost_var:.1f}%", delta="Target: <10%")
+            st.metric("Cost Variance", f"{cost_var:.1f}%" if pd.notna(cost_var) else "N/A", delta="Target: <10%")
+    else:
+        with col4:
+            st.metric("Cost Variance", "N/A", delta="Target: <10%")
 
 
 def display_vendor_rankings():
@@ -166,46 +265,50 @@ def display_vendor_rankings():
     with tab1:
         if 'on_time_delivery' in st.session_state.kpis:
             df = st.session_state.kpis['on_time_delivery'].copy()
-            if not df.empty and 'vendor_id' in df.columns:
+            metric_col = _get_metric_column(df, ['on_time_delivery_rate'])
+            if not df.empty and 'vendor_id' in df.columns and metric_col:
                 df = df.merge(vendors_df[['vendor_id', 'vendor_name']], on='vendor_id')
-                df_sorted = df.sort_values('on_time_delivery_rate', ascending=False).head(10)
-                fig = px.bar(df_sorted, x='vendor_name', y='on_time_delivery_rate', 
-                            title="On-Time Delivery Rate by Vendor", color='on_time_delivery_rate')
+                df_sorted = df.sort_values(metric_col, ascending=False).head(10)
+                fig = px.bar(df_sorted, x='vendor_name', y=metric_col,
+                            title="On-Time Delivery Rate by Vendor", color=metric_col)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(df_sorted[['vendor_name', 'on_time_delivery_rate']], use_container_width=True)
+                st.dataframe(df_sorted[['vendor_name', metric_col]], use_container_width=True)
     
     with tab2:
         if 'defect_rate' in st.session_state.kpis:
             df = st.session_state.kpis['defect_rate'].copy()
-            if not df.empty and 'vendor_id' in df.columns:
+            metric_col = _get_metric_column(df, ['defect_rate'])
+            if not df.empty and 'vendor_id' in df.columns and metric_col:
                 df = df.merge(vendors_df[['vendor_id', 'vendor_name']], on='vendor_id')
-                df_sorted = df.sort_values('defect_rate', ascending=True).head(10)
-                fig = px.bar(df_sorted, x='vendor_name', y='defect_rate',
-                            title="Defect Rate by Vendor (Lower is Better)", color='defect_rate')
+                df_sorted = df.sort_values(metric_col, ascending=True).head(10)
+                fig = px.bar(df_sorted, x='vendor_name', y=metric_col,
+                            title="Defect Rate by Vendor (Lower is Better)", color=metric_col)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(df_sorted[['vendor_name', 'defect_rate']], use_container_width=True)
+                st.dataframe(df_sorted[['vendor_name', metric_col]], use_container_width=True)
     
     with tab3:
         if 'lead_time_variance' in st.session_state.kpis:
             df = st.session_state.kpis['lead_time_variance'].copy()
-            if not df.empty and 'vendor_id' in df.columns:
+            metric_col = _get_metric_column(df, ['avg_variance', 'lead_time_variance_days'])
+            if not df.empty and 'vendor_id' in df.columns and metric_col:
                 df = df.merge(vendors_df[['vendor_id', 'vendor_name']], on='vendor_id')
-                df_sorted = df.sort_values('lead_time_variance_days', ascending=True).head(10)
-                fig = px.bar(df_sorted, x='vendor_name', y='lead_time_variance_days',
-                            title="Lead Time Variance by Vendor", color='lead_time_variance_days')
+                df_sorted = df.sort_values(metric_col, ascending=True).head(10)
+                fig = px.bar(df_sorted, x='vendor_name', y=metric_col,
+                            title="Lead Time Variance by Vendor", color=metric_col)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(df_sorted[['vendor_name', 'lead_time_variance_days']], use_container_width=True)
+                st.dataframe(df_sorted[['vendor_name', metric_col]], use_container_width=True)
     
     with tab4:
         if 'cost_variance' in st.session_state.kpis:
             df = st.session_state.kpis['cost_variance'].copy()
-            if not df.empty and 'vendor_id' in df.columns:
+            metric_col = _get_metric_column(df, ['cost_variance_percent'])
+            if not df.empty and 'vendor_id' in df.columns and metric_col:
                 df = df.merge(vendors_df[['vendor_id', 'vendor_name']], on='vendor_id')
-                df_sorted = df.sort_values('cost_variance_percent', ascending=True).head(10)
-                fig = px.bar(df_sorted, x='vendor_name', y='cost_variance_percent',
-                            title="Cost Variance by Vendor", color='cost_variance_percent')
+                df_sorted = df.sort_values(metric_col, ascending=True).head(10)
+                fig = px.bar(df_sorted, x='vendor_name', y=metric_col,
+                            title="Cost Variance by Vendor", color=metric_col)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(df_sorted[['vendor_name', 'cost_variance_percent']], use_container_width=True)
+                st.dataframe(df_sorted[['vendor_name', metric_col]], use_container_width=True)
 
 
 def display_raw_data():
@@ -280,11 +383,39 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Control Panel")
+
+        data_mode = st.radio(
+            "Data Source",
+            ["Sample data", "Upload custom CSV files"],
+            index=0,
+            help="Choose bundled sample files or upload your own CSV files for analysis."
+        )
+
+        vendors_file = None
+        po_file = None
+        deliveries_file = None
+        quality_file = None
+
+        if data_mode == "Upload custom CSV files":
+            st.markdown("### Upload Required Files")
+            vendors_file = st.file_uploader("vendors.csv", type=["csv"], key="vendors_upload")
+            po_file = st.file_uploader("purchase_orders.csv", type=["csv"], key="po_upload")
+            deliveries_file = st.file_uploader("deliveries.csv", type=["csv"], key="deliveries_upload")
+            quality_file = st.file_uploader("quality_inspections.csv", type=["csv"], key="quality_upload")
+
+            with st.expander("Required Columns for Custom Files"):
+                st.json(REQUIRED_UPLOAD_COLUMNS)
         
         if st.button("🔄 Load & Process Data", use_container_width=True):
-            if load_data():
+            if data_mode == "Upload custom CSV files":
+                load_success = load_custom_data(vendors_file, po_file, deliveries_file, quality_file)
+            else:
+                load_success = load_sample_data()
+
+            if load_success:
                 validation_results = transform_and_validate_data()
-                if validation_results:
+                st.session_state.validation_results = validation_results
+                if validation_results is not None:
                     st.success("✓ Data loaded and processed successfully!")
                     calculate_kpis()
         
@@ -301,7 +432,18 @@ def main():
         
         st.divider()
         st.markdown("### 📂 Data Source")
-        st.info(f"Data location: `{config.RAW_DATA_PATH}`")
+        st.info(f"Selected source: {st.session_state.data_source}")
+
+        if st.session_state.validation_results:
+            invalid_sources = {
+                source: errors
+                for source, (is_valid, errors) in st.session_state.validation_results.items()
+                if not is_valid
+            }
+            if invalid_sources:
+                with st.expander("Validation Warnings", expanded=False):
+                    for source, errors in invalid_sources.items():
+                        st.warning(f"{source}: {'; '.join(errors)}")
         
         with st.expander("Configuration"):
             st.json({

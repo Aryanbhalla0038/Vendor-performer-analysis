@@ -14,6 +14,31 @@ class KPICalculator:
     def __init__(self, config):
         """Initialize KPI calculator."""
         self.config = config
+
+    def _apply_time_window(self, df: pd.DataFrame, date_column: str, window_days: int) -> pd.DataFrame:
+        """Apply rolling date filter, with fallback to full data when window has no rows."""
+        if df.empty or date_column not in df.columns:
+            return df
+
+        filtered_df = df.copy()
+        filtered_df[date_column] = pd.to_datetime(filtered_df[date_column], errors='coerce')
+        filtered_df = filtered_df[filtered_df[date_column].notna()]
+
+        if filtered_df.empty:
+            return filtered_df
+
+        cutoff_date = pd.Timestamp.now() - timedelta(days=window_days)
+        window_df = filtered_df[filtered_df[date_column] >= cutoff_date]
+
+        if window_df.empty:
+            logger.warning(
+                "No records in the last %s days for %s; falling back to full available history.",
+                window_days,
+                date_column,
+            )
+            return filtered_df
+
+        return window_df
     
     def calculate_on_time_delivery(self, deliveries: pd.DataFrame, window_days: int = 30) -> pd.DataFrame:
         """Calculate on-time delivery rate by vendor."""
@@ -22,10 +47,8 @@ class KPICalculator:
         
         df = deliveries.copy()
         
-        # Filter to recent data
-        if 'actual_delivery_date' in df.columns:
-            cutoff_date = pd.Timestamp.now() - timedelta(days=window_days)
-            df = df[df['actual_delivery_date'] >= cutoff_date]
+        # Filter to recent data with fallback to full history when needed.
+        df = self._apply_time_window(df, 'actual_delivery_date', window_days)
         
         # Calculate on-time delivery rate
         if 'is_on_time' in df.columns:
@@ -50,10 +73,8 @@ class KPICalculator:
         
         df = quality_data.copy()
         
-        # Filter to recent data
-        if 'inspection_date' in df.columns:
-            cutoff_date = pd.Timestamp.now() - timedelta(days=window_days)
-            df = df[df['inspection_date'] >= cutoff_date]
+        # Filter to recent data with fallback to full history when needed.
+        df = self._apply_time_window(df, 'inspection_date', window_days)
         
         # Group by vendor
         defect_summary = df.groupby('vendor_id').agg({
@@ -81,13 +102,19 @@ class KPICalculator:
         
         # Calculate lead time
         if 'actual_delivery_date' in df.columns and 'scheduled_delivery_date' in df.columns:
+            df['actual_delivery_date'] = pd.to_datetime(df['actual_delivery_date'], errors='coerce')
+            df['scheduled_delivery_date'] = pd.to_datetime(df['scheduled_delivery_date'], errors='coerce')
+            df = df[df['actual_delivery_date'].notna() & df['scheduled_delivery_date'].notna()]
+
+            if df.empty:
+                return pd.DataFrame()
+
             df['lead_time_variance'] = (
                 df['actual_delivery_date'] - df['scheduled_delivery_date']
             ).dt.days
-            
-            # Filter to recent data
-            cutoff_date = pd.Timestamp.now() - timedelta(days=window_days)
-            df = df[df['actual_delivery_date'] >= cutoff_date]
+
+            # Filter to recent data with fallback to full history when needed.
+            df = self._apply_time_window(df, 'actual_delivery_date', window_days)
             
             # Calculate statistics by vendor
             variance_summary = df.groupby('vendor_id').agg({
@@ -153,15 +180,22 @@ class KPICalculator:
     def calculate_all_kpis(self, data_dict: dict) -> dict:
         """Calculate all KPIs."""
         kpis = {}
+        window_days = getattr(self.config, 'LOOKBACK_DAYS', 90)
         
         if 'deliveries' in data_dict:
-            kpis['on_time_delivery'] = self.calculate_on_time_delivery(data_dict['deliveries'])
+            kpis['on_time_delivery'] = self.calculate_on_time_delivery(
+                data_dict['deliveries'], window_days=window_days
+            )
         
         if 'quality_data' in data_dict:
-            kpis['defect_rate'] = self.calculate_defect_rate(data_dict['quality_data'])
+            kpis['defect_rate'] = self.calculate_defect_rate(
+                data_dict['quality_data'], window_days=window_days
+            )
         
         if 'deliveries' in data_dict:
-            kpis['lead_time_variance'] = self.calculate_lead_time_variance(data_dict['deliveries'])
+            kpis['lead_time_variance'] = self.calculate_lead_time_variance(
+                data_dict['deliveries'], window_days=window_days
+            )
         
         if 'purchase_orders' in data_dict and 'deliveries' in data_dict:
             kpis['cost_variance'] = self.calculate_cost_variance(
