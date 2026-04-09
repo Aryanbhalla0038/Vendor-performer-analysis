@@ -2,6 +2,7 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import sys
 from pathlib import Path
 import plotly.express as px
@@ -12,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from config import config
 from pipeline import DataLoader, DataTransformer, DataValidator, KPICalculator
-from utilities import setup_logger, export_to_excel
+from utilities import setup_logger
 
 # Configure page
 st.set_page_config(
@@ -44,6 +45,43 @@ REQUIRED_UPLOAD_COLUMNS = {
     'quality_data': ['inspection_id', 'delivery_id', 'vendor_id', 'inspection_date', 'defect_count', 'total_items']
 }
 
+TEMPLATE_SAMPLE_ROWS = {
+    'vendors': {
+        'vendor_id': 1001,
+        'vendor_name': 'Example Vendor',
+        'country': 'USA',
+        'vendor_category': 'Electronics'
+    },
+    'purchase_orders': {
+        'po_id': 5001,
+        'vendor_id': 1001,
+        'order_value': 25000,
+        'po_date': '2026-03-01'
+    },
+    'deliveries': {
+        'delivery_id': 9001,
+        'po_id': 5001,
+        'vendor_id': 1001,
+        'actual_delivery_date': '2026-03-12',
+        'scheduled_delivery_date': '2026-03-10'
+    },
+    'quality_data': {
+        'inspection_id': 3001,
+        'delivery_id': 9001,
+        'vendor_id': 1001,
+        'inspection_date': '2026-03-13',
+        'defect_count': 5,
+        'total_items': 500
+    }
+}
+
+UPLOAD_FILE_NAMES = {
+    'vendors': 'vendors.csv',
+    'purchase_orders': 'purchase_orders.csv',
+    'deliveries': 'deliveries.csv',
+    'quality_data': 'quality_inspections.csv'
+}
+
 
 def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize input column names for consistent downstream processing."""
@@ -68,6 +106,251 @@ def _assign_loaded_data(vendors, purchase_orders, deliveries, quality_data, sour
     st.session_state.quality_data = quality_data
     st.session_state.data_loaded = True
     st.session_state.data_source = source_label
+
+
+def _scale_score(series: pd.Series, inverse: bool = False) -> pd.Series:
+    """Scale values to a 0-100 score."""
+    numeric = pd.to_numeric(series, errors='coerce')
+    if numeric.notna().sum() == 0:
+        return pd.Series([np.nan] * len(series), index=series.index)
+
+    min_val = numeric.min()
+    max_val = numeric.max()
+    if pd.isna(min_val) or pd.isna(max_val) or min_val == max_val:
+        base = pd.Series([100.0] * len(series), index=series.index)
+    else:
+        base = (numeric - min_val) / (max_val - min_val) * 100
+
+    return 100 - base if inverse else base
+
+
+def _build_template_csv(dataset_name: str) -> bytes:
+    """Build downloadable CSV template for custom upload datasets."""
+    columns = REQUIRED_UPLOAD_COLUMNS[dataset_name]
+    sample_row = {col: '' for col in columns}
+    sample_row.update(TEMPLATE_SAMPLE_ROWS.get(dataset_name, {}))
+    template_df = pd.DataFrame([sample_row], columns=columns)
+    return template_df.to_csv(index=False).encode('utf-8')
+
+
+def _prepare_vendor_scorecard() -> pd.DataFrame:
+    """Create composite scorecard from KPI outputs for advanced analysis views."""
+    if st.session_state.vendors is None or st.session_state.kpis is None:
+        return pd.DataFrame()
+
+    vendors_df = st.session_state.vendors.copy()
+    if 'vendor_id' not in vendors_df.columns:
+        return pd.DataFrame()
+
+    columns = [col for col in ['vendor_id', 'vendor_name', 'country', 'vendor_category', 'monthly_spend'] if col in vendors_df.columns]
+    scorecard = vendors_df[columns].drop_duplicates('vendor_id').copy()
+
+    kpis = st.session_state.kpis
+
+    metric_maps = [
+        ('on_time_delivery', ['on_time_delivery_rate'], 'otd_rate'),
+        ('defect_rate', ['defect_rate'], 'defect_rate'),
+        ('lead_time_variance', ['avg_variance', 'lead_time_variance_days'], 'lead_time_variance_days'),
+        ('cost_variance', ['cost_variance_percent'], 'cost_variance_percent'),
+    ]
+
+    for kpi_name, candidates, output_name in metric_maps:
+        kpi_df = kpis.get(kpi_name, pd.DataFrame())
+        metric_col = _get_metric_column(kpi_df, candidates)
+        if metric_col and 'vendor_id' in kpi_df.columns:
+            metric_df = kpi_df[['vendor_id', metric_col]].copy()
+            metric_df = metric_df.rename(columns={metric_col: output_name})
+            scorecard = scorecard.merge(metric_df, on='vendor_id', how='left')
+        else:
+            scorecard[output_name] = np.nan
+
+    numeric_cols = ['otd_rate', 'defect_rate', 'lead_time_variance_days', 'cost_variance_percent']
+    for col in numeric_cols:
+        if col in scorecard.columns:
+            scorecard[col] = pd.to_numeric(scorecard[col], errors='coerce')
+
+    scorecard['lead_time_variance_abs'] = scorecard['lead_time_variance_days'].abs()
+    scorecard['otd_score'] = _scale_score(scorecard['otd_rate'])
+    scorecard['defect_score'] = _scale_score(scorecard['defect_rate'], inverse=True)
+    scorecard['lead_time_score'] = _scale_score(scorecard['lead_time_variance_abs'], inverse=True)
+    scorecard['cost_score'] = _scale_score(scorecard['cost_variance_percent'], inverse=True)
+
+    scorecard['composite_score'] = (
+        scorecard['otd_score'] * 0.35
+        + scorecard['defect_score'] * 0.25
+        + scorecard['lead_time_score'] * 0.20
+        + scorecard['cost_score'] * 0.20
+    ).round(2)
+
+    scorecard['reliability_index'] = (
+        scorecard['otd_score'] * 0.7 + scorecard['defect_score'] * 0.3
+    ).round(2)
+    scorecard['efficiency_index'] = (
+        scorecard['lead_time_score'] * 0.6 + scorecard['cost_score'] * 0.4
+    ).round(2)
+
+    scorecard['performance_tier'] = pd.cut(
+        scorecard['composite_score'],
+        bins=[-0.1, 50, 75, 100],
+        labels=['Recovery Zone', 'Steady Performer', 'Strategic Partner']
+    ).astype(str)
+
+    scorecard['rank'] = scorecard['composite_score'].rank(ascending=False, method='dense').astype('Int64')
+    return scorecard.sort_values('composite_score', ascending=False)
+
+
+def display_data_health() -> None:
+    """Show overall data health and completeness for current dataset."""
+    if not st.session_state.data_loaded:
+        return
+
+    datasets = {
+        'vendors': st.session_state.vendors,
+        'purchase_orders': st.session_state.purchase_orders,
+        'deliveries': st.session_state.deliveries,
+        'quality_data': st.session_state.quality_data,
+    }
+
+    completeness_scores = []
+    for df in datasets.values():
+        if df is not None and not df.empty:
+            completeness_scores.append((1 - (df.isna().sum().sum() / (df.shape[0] * df.shape[1]))) * 100)
+
+    avg_completeness = float(np.mean(completeness_scores)) if completeness_scores else 0.0
+    validation_issues = 0
+    if st.session_state.validation_results:
+        validation_issues = sum(
+            len(errors)
+            for _, (is_valid, errors) in st.session_state.validation_results.items()
+            if not is_valid
+        )
+
+    st.subheader("🧪 Data Health Cockpit")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Data Completeness", f"{avg_completeness:.1f}%")
+    with col2:
+        st.metric("Validation Issues", str(validation_issues))
+    with col3:
+        st.metric("Data Source", st.session_state.data_source)
+
+
+def display_vendor_intelligence(scorecard: pd.DataFrame) -> None:
+    """Render differentiated insight views beyond standard KPI charts."""
+    st.subheader("🚀 Vendor Intelligence Hub")
+    if scorecard.empty:
+        st.info("Load data to generate intelligence insights.")
+        return
+
+    tab1, tab2, tab3 = st.tabs([
+        "Performance DNA",
+        "Risk Radar",
+        "Action Feed"
+    ])
+
+    with tab1:
+        top_cols = [col for col in ['rank', 'vendor_name', 'composite_score', 'performance_tier', 'otd_rate', 'defect_rate'] if col in scorecard.columns]
+        st.dataframe(scorecard[top_cols].head(10), use_container_width=True)
+
+        fig = px.bar(
+            scorecard.head(10),
+            x='vendor_name',
+            y='composite_score',
+            color='performance_tier',
+            title='Top Vendors by Composite Performance Score'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        bubble_size = 'monthly_spend' if 'monthly_spend' in scorecard.columns else None
+        fig = px.scatter(
+            scorecard,
+            x='reliability_index',
+            y='efficiency_index',
+            size=bubble_size,
+            color='performance_tier',
+            hover_name='vendor_name',
+            title='Reliability vs Efficiency Vendor Risk Radar'
+        )
+        fig.add_hline(y=60, line_dash='dash', line_color='gray')
+        fig.add_vline(x=60, line_dash='dash', line_color='gray')
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab3:
+        top_vendor = scorecard.iloc[0]
+        risk_vendor = scorecard.sort_values('composite_score').iloc[0]
+        big_spend_vendor = scorecard.sort_values('monthly_spend', ascending=False).iloc[0] if 'monthly_spend' in scorecard.columns else None
+
+        st.success(
+            f"Top Strategic Partner: {top_vendor.get('vendor_name', 'N/A')} "
+            f"(Score {top_vendor.get('composite_score', np.nan):.1f})"
+        )
+        st.warning(
+            f"Immediate Focus Vendor: {risk_vendor.get('vendor_name', 'N/A')} "
+            f"(Score {risk_vendor.get('composite_score', np.nan):.1f})"
+        )
+        if big_spend_vendor is not None:
+            st.info(
+                f"Largest Spend Exposure: {big_spend_vendor.get('vendor_name', 'N/A')} "
+                f"(${big_spend_vendor.get('monthly_spend', 0):,.0f}/month)"
+            )
+
+
+def display_what_if_simulator(scorecard: pd.DataFrame) -> None:
+    """Allow user to tune KPI thresholds and view impacted vendor counts."""
+    st.subheader("🎛️ What-If Threshold Simulator")
+    if scorecard.empty:
+        st.info("Load data to simulate threshold scenarios.")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        otd_target = st.slider("Min On-Time %", 70, 100, 95)
+    with col2:
+        defect_target = st.slider("Max Defect %", 1, 20, 5)
+    with col3:
+        lead_target = st.slider("Max Lead Variance (days)", 1, 15, 3)
+    with col4:
+        cost_target = st.slider("Max Cost Variance %", 1, 30, 10)
+
+    sim_df = scorecard.copy()
+    sim_df['breach_otd'] = sim_df['otd_rate'] < otd_target
+    sim_df['breach_defect'] = sim_df['defect_rate'] > defect_target
+    sim_df['breach_lead'] = sim_df['lead_time_variance_abs'] > lead_target
+    sim_df['breach_cost'] = sim_df['cost_variance_percent'] > cost_target
+
+    breach_cols = ['breach_otd', 'breach_defect', 'breach_lead', 'breach_cost']
+    sim_df[breach_cols] = sim_df[breach_cols].fillna(False)
+    sim_df['breach_count'] = sim_df[breach_cols].sum(axis=1)
+
+    compliant = int((sim_df['breach_count'] == 0).sum())
+    elevated_risk = int((sim_df['breach_count'] >= 2).sum())
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Compliant Vendors", compliant)
+    with m2:
+        st.metric("Elevated-Risk Vendors", elevated_risk)
+    with m3:
+        st.metric("Average Breach Count", f"{sim_df['breach_count'].mean():.2f}")
+
+    focus_cols = [col for col in ['vendor_name', 'breach_count', 'otd_rate', 'defect_rate', 'lead_time_variance_days', 'cost_variance_percent'] if col in sim_df.columns]
+    st.dataframe(sim_df.sort_values('breach_count', ascending=False)[focus_cols].head(10), use_container_width=True)
+
+
+def display_upload_templates() -> None:
+    """Expose downloadable CSV templates to simplify custom uploads."""
+    with st.expander("Download CSV Templates"):
+        for dataset_name in ['vendors', 'purchase_orders', 'deliveries', 'quality_data']:
+            output_file = UPLOAD_FILE_NAMES[dataset_name]
+            st.download_button(
+                label=f"Download {output_file} template",
+                data=_build_template_csv(dataset_name),
+                file_name=output_file,
+                mime='text/csv',
+                use_container_width=True,
+                key=f"template_{dataset_name}"
+            )
 
 
 def load_sample_data():
@@ -405,6 +688,19 @@ def main():
 
             with st.expander("Required Columns for Custom Files"):
                 st.json(REQUIRED_UPLOAD_COLUMNS)
+
+        display_upload_templates()
+
+        if st.button("🧹 Reset Loaded Data", use_container_width=True):
+            st.session_state.data_loaded = False
+            st.session_state.vendors = None
+            st.session_state.purchase_orders = None
+            st.session_state.deliveries = None
+            st.session_state.quality_data = None
+            st.session_state.kpis = None
+            st.session_state.validation_results = None
+            st.session_state.data_source = "Sample data"
+            st.success("Session data reset.")
         
         if st.button("🔄 Load & Process Data", use_container_width=True):
             if data_mode == "Upload custom CSV files":
@@ -465,6 +761,17 @@ def main():
     else:
         # Display KPI cards
         display_kpi_cards()
+
+        st.divider()
+        display_data_health()
+
+        scorecard = _prepare_vendor_scorecard()
+
+        st.divider()
+        display_vendor_intelligence(scorecard)
+
+        st.divider()
+        display_what_if_simulator(scorecard)
         
         st.divider()
         
